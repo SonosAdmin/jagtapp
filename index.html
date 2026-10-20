@@ -1,4 +1,4 @@
-<!doctype html><html lang="da"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>JagtApp – prototype v1.9 – klikbare officielle matrikler</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><style>
+<!doctype html><html lang="da"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>JagtApp – prototype v2.0 – klikbare officielle matrikler</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><style>
 *{box-sizing:border-box}
 html,body{margin:0;width:100%;height:100%;overflow:hidden}
 body{font:15px system-ui;background:#f5f6f1;color:#243329;display:flex;flex-direction:column}
@@ -70,7 +70,7 @@ const OfficialParcelGrid=L.GridLayer.extend({
     return tile;
   }
 });
-// JagtApp 1.9: Hent officielle jordstykker som GeoJSON fra Cloudflare.
+// JagtApp 2.0: Opdel kortudsnit automatisk og hent alle matrikler inden for sikre grænser.
 // Indlæsning sker kun ved knaptryk, så et kortskift ikke fjerner brugerens valg.
 let loadingOfficialParcels = false;
 $('loadOfficialParcels').onclick = async () => {
@@ -80,11 +80,13 @@ $('loadOfficialParcels').onclick = async () => {
   const el = $('officialParcelStatus');
   if (selectedParcels.size && !confirm('Du har valgte matrikler. Hentning erstatter listen og nulstiller valget. Fortsæt?')) return;
   const bounds = map.getBounds();
-  const southWest = L.CRS.EPSG3857.project(bounds.getSouthWest());
-  const northEast = L.CRS.EPSG3857.project(bounds.getNorthEast());
-  const bbox = [southWest.x, southWest.y, northEast.x, northEast.y];
-  if (bbox.some(v => !Number.isFinite(v)) || bbox[2] - bbox[0] > 5000 || bbox[3] - bbox[1] > 5000) {
-    el.textContent = 'Zoom længere ind. Kortudsnittet må højst være 5 km i hver retning.';
+  const sw = L.CRS.EPSG3857.project(bounds.getSouthWest());
+  const ne = L.CRS.EPSG3857.project(bounds.getNorthEast());
+  const bbox = [sw.x, sw.y, ne.x, ne.y];
+  const width = bbox[2] - bbox[0], height = bbox[3] - bbox[1];
+  // Undgå uoverskueligt mange forespørgsler og meget store kortudsnit.
+  if (bbox.some(v => !Number.isFinite(v)) || width <= 0 || height <= 0 || width > 12000 || height > 12000) {
+    el.textContent = 'Zoom lidt ind. Kortudsnittet må højst være 12 km i hver retning.';
     return;
   }
   const center = map.getCenter();
@@ -94,31 +96,68 @@ $('loadOfficialParcels').onclick = async () => {
   }
   loadingOfficialParcels = true;
   $('loadOfficialParcels').disabled = true;
-  el.textContent = 'Henter officielle matrikler…';
-  try {
-    const params = new URLSearchParams({bbox: bbox.join(',')});
-    const response = await fetch(proxy + '/jordstykker?' + params.toString(), {cache:'no-store'});
+  let requests = 0;
+  const maxRequests = 120;
+  const maxDepth = 9;
+  const seen = new Set();
+  const collected = [];
+  const addFeature = f => {
+    if (!f || !f.geometry || !['Polygon', 'MultiPolygon'].includes(f.geometry.type)) return;
+    // Workerens parcel-0, parcel-1 osv. er kun lokale ID'er pr. forespørgsel.
+    // Brug derfor geometri + matrikeloplysninger til at fjerne dubletter.
+    const props = f.properties || {};
+    const id = JSON.stringify([props.ejerlavskode, props.matrikelnummer, f.geometry]);
+    if (seen.has(id)) return;
+    seen.add(id);
+    collected.push(f);
+  };
+  const fetchBox = async (box, depth = 0) => {
+    if (++requests > maxRequests) throw new Error('Området kræver for mange forespørgsler. Zoom lidt ind og prøv igen.');
+    el.textContent = 'Henter matrikler i mindre områder… ' + requests + ' forespørgsler, ' + collected.length + ' fundet.';
+    const params = new URLSearchParams({bbox:box.join(',')});
+    const response = await fetch(proxy + '/jordstykker?' + params, {cache:'no-store'});
     if (!response.ok) throw new Error('Tjenesten svarede HTTP ' + response.status);
     const result = await response.json();
     if (result.type !== 'FeatureCollection' || !Array.isArray(result.features)) throw new Error('Ugyldigt GeoJSON-svar');
-    const polygons = result.features.filter(f => f && f.geometry && ['Polygon','MultiPolygon'].includes(f.geometry.type));
-    if (!polygons.length) {
-      el.textContent = 'Ingen matrikelpolygoner i udsnittet. Prøv et andet sted.';
+    const w = box[2]-box[0], h = box[3]-box[1];
+    // Cloudflare tillader højst 5 km i hver retning, og WFS returnerer højst 100 poster.
+    // Ved 100 poster opdeles området igen, så intet udelades stiltiende.
+    if (w > 4900 || h > 4900 || result.features.length >= 100) {
+      if (depth >= maxDepth || Math.max(w,h) < 20) throw new Error('For mange matrikler på et meget lille område. Zoom ind og prøv igen.');
+      const mx=(box[0]+box[2])/2, my=(box[1]+box[3])/2;
+      const subBoxes = w > 4900 || (w >= h && h <= 4900)
+        ? [[box[0],box[1],mx,box[3]],[mx,box[1],box[2],box[3]]]
+        : [[box[0],box[1],box[2],my],[box[0],my,box[2],box[3]]];
+      for (const sub of subBoxes) await fetchBox(sub, depth+1);
       return;
     }
-    if (polygons.length >= 100) {
-      el.textContent = 'Der blev hentet mindst 100 matrikler (serverens grænse). Zoom længere ind for at sikre, at alle kommer med.';
-      return;
-    }
-    parcelFeatures = polygons;
+    result.features.forEach(addFeature);
+  };
+  try {
+    // Del altid store udsnit inden serverkald, så 5 km-grænsen overholdes.
+    const loadSafely = async (box, depth=0) => {
+      const w=box[2]-box[0], h=box[3]-box[1];
+      if (w > 4900 || h > 4900) {
+        const splitX = w >= h;
+        const mid = splitX ? (box[0]+box[2])/2 : (box[1]+box[3])/2;
+        const halves = splitX
+          ? [[box[0],box[1],mid,box[3]],[mid,box[1],box[2],box[3]]]
+          : [[box[0],box[1],box[2],mid],[box[0],mid,box[2],box[3]]];
+        for (const half of halves) await loadSafely(half,depth+1);
+      } else await fetchBox(box,depth);
+    };
+    await loadSafely(bbox);
+    if (!collected.length) {el.textContent='Ingen matrikler fundet i udsnittet. Prøv et andet sted.';return;}
+    // Udskift først gamle valg, når ALLE delområder er hentet korrekt.
+    parcelFeatures = collected;
     selectedParcels.clear();
     parcelMode = true;
     $('selectParcels').classList.add('active');
     refreshParcels();
-    el.textContent = polygons.length + ' officielle matrikler hentet. Klik på de gule polygoner for at vælge dem. Kontrollér grænserne inden du gemmer.';
-    localStorage.setItem(proxyStorageKey, proxy);
-  } catch (error) {
-    el.textContent = 'Kunne ikke hente matrikler: ' + error.message;
+    el.textContent = collected.length + ' klikbare matrikler hentet (' + requests + ' forespørgsler). Klik på matriklerne for at vælge dem.';
+    localStorage.setItem(proxyStorageKey,proxy);
+  } catch(error) {
+    el.textContent = 'Hentning afbrudt: ' + error.message + ' Tidligere indlæste matrikler er bevaret.';
   } finally {
     loadingOfficialParcels = false;
     $('loadOfficialParcels').disabled = false;
